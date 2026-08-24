@@ -537,6 +537,45 @@ DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Active Open Positions Section -->
+    <div class="section-card" style="margin-bottom: 24px;">
+        <div class="section-header">
+            <div class="section-title">
+                <i class="fa-solid fa-chart-line" style="color: var(--accent-purple);"></i>
+                Active Open Positions (Bitget Futures)
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary);" id="positions-count-badge">
+                0 Active Positions
+            </div>
+        </div>
+
+        <div class="table-responsive">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Size (Contracts)</th>
+                        <th>Entry Price</th>
+                        <th>Mark Price</th>
+                        <th>Margin (USDT)</th>
+                        <th>Leverage</th>
+                    </tr>
+                </thead>
+                <tbody id="positions-tbody">
+                    <tr>
+                        <td colspan="7">
+                            <div class="empty-state" style="padding: 24px 20px;">
+                                <i class="fa-solid fa-folder-open"></i>
+                                <p>No active open positions on Bitget Futures right now.</p>
+                            </div>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
     <!-- Webhook Logs Table -->
     <div class="section-card">
         <div class="section-header">
@@ -624,7 +663,16 @@ DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('stat-balance').innerText = "Keys Required";
             }
 
-            // 3. Fetch Logs
+            // 3. Fetch Open Positions
+            try {
+                const posRes = await fetch('/api/positions');
+                const positions = await posRes.json();
+                renderPositions(positions);
+            } catch(e) {
+                console.error("Positions fetch error:", e);
+            }
+
+            // 4. Fetch Logs
             const logsRes = await fetch('/api/logs');
             const logs = await logsRes.json();
             logsCache = logs;
@@ -633,6 +681,43 @@ DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
         } catch (err) {
             console.error("Failed to fetch dashboard data:", err);
         }
+    }
+
+    function renderPositions(positions) {
+        const tbody = document.getElementById('positions-tbody');
+        const badge = document.getElementById('positions-count-badge');
+        
+        if (!positions || positions.length === 0) {
+            badge.innerText = "0 Active Positions";
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="7">
+                        <div class="empty-state" style="padding: 20px;">
+                            <i class="fa-solid fa-folder-open"></i>
+                            <p style="font-size: 13px;">No active open positions on Bitget Futures right now.</p>
+                        </div>
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        badge.innerText = `${positions.length} Active Position(s)`;
+        tbody.innerHTML = positions.map(pos => {
+            const isLong = pos.side.toLowerCase() === 'long';
+            const sideClass = isLong ? 'badge-long' : 'badge-short';
+            return `
+                <tr>
+                    <td style="font-weight: 700; color: var(--text-primary);">${pos.symbol}</td>
+                    <td><span class="badge ${sideClass}">${pos.side.toUpperCase()}</span></td>
+                    <td style="font-weight: 600;">${pos.size}</td>
+                    <td>$${parseFloat(pos.entry_price || 0).toFixed(2)}</td>
+                    <td>$${parseFloat(pos.mark_price || 0).toFixed(2)}</td>
+                    <td style="color: var(--accent-purple); font-weight: 600;">$${parseFloat(pos.margin || 0).toFixed(2)}</td>
+                    <td><span class="badge" style="background: rgba(139, 92, 246, 0.15); color: var(--accent-purple);">${pos.leverage}x</span></td>
+                </tr>
+            `;
+        }).join('');
     }
 
     function renderLogs(logs) {
@@ -738,6 +823,11 @@ def health_check():
 @app.get("/balance")
 def get_balance(market: str = "futures"):
     return bitget_client.get_account_balance(market_type=market)
+
+@app.get("/api/positions")
+def get_open_positions():
+    """Return active live open positions on Bitget Futures."""
+    return bitget_client.get_open_positions()
 
 @app.get("/api/logs")
 def get_webhook_logs(limit: int = 100):

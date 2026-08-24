@@ -135,8 +135,12 @@ class BitgetExchange:
                 return 0.0
             
             amount = position_notional / price
-            # Round based on market precision
-            return round(amount, 2)
+            # Round based on market precision (e.g. 0.0007 BTC)
+            try:
+                prec_str = exchange.amount_to_precision(ccxt_symbol, amount)
+                return float(prec_str)
+            except Exception:
+                return round(amount, 4)
         except Exception as e:
             logger.error(f"Error fetching ticker for {ccxt_symbol}: {e}")
             return 0.0
@@ -339,12 +343,41 @@ class BitgetExchange:
             return {
                 "success": True,
                 "market_type": market_type,
-                "total_usdt": float(total_usdt),
-                "free_usdt": float(free_usdt),
+                "total_usdt": round(total_usdt, 2),
+                "usdt_cash": float(total_usdt),
                 "raw": balance
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def get_open_positions(self) -> List[Dict[str, Any]]:
+        """Fetch active live open positions from Bitget Futures V2 API."""
+        self._initialize_exchanges()
+        if not self._futures_exchange:
+            return []
+        
+        try:
+            res = self._futures_exchange.privateMixGetV2MixPositionAllPosition({'productType': 'USDT-FUTURES'})
+            positions = []
+            for pos in res.get("data", []):
+                total_contracts = float(pos.get("total", 0) or pos.get("available", 0) or 0)
+                if total_contracts > 0:
+                    raw_symbol = pos.get("symbol", "")
+                    clean_symbol = raw_symbol.replace("_UMCBL", "").replace("_SPBL", "")
+                    hold_side = pos.get("holdSide", "long").lower()
+                    positions.append({
+                        "symbol": clean_symbol,
+                        "side": hold_side,
+                        "size": total_contracts,
+                        "entry_price": float(pos.get("openPrice", 0) or pos.get("averageOpenPrice", 0) or 0),
+                        "mark_price": float(pos.get("marketPrice", 0) or 0),
+                        "margin": float(pos.get("margin", 0) or 0),
+                        "leverage": pos.get("leverage", "10")
+                    })
+            return positions
+        except Exception as e:
+            logger.error(f"Error fetching open positions: {e}")
+            return []
 
 # Singleton instance
 bitget_client = BitgetExchange()
