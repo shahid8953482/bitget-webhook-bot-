@@ -877,9 +877,28 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
 
     logger.info(f"Signal Details -> Action: {action.upper()} | Symbol: {symbol} | Amount: {amount} | Market: {payload.market_type}")
 
-    # 3. Handle 'close' or 'close_all' position signals
-    if action in ["close", "close_all"]:
+    # 3. Check for close/exit signals (e.g. 'close', 'Close entry(s) order target01_buy', etc.)
+    is_close_signal = any(term in action for term in ["close", "exit", "cancel", "target01"])
+    
+    if is_close_signal:
         ccxt_symbol = bitget_client.normalize_symbol(symbol, payload.market_type)
+        open_positions = bitget_client.get_open_positions()
+        matching_pos = [p for p in open_positions if bitget_client.normalize_symbol(p["symbol"], "futures") == ccxt_symbol]
+        
+        if not matching_pos:
+            logger.info(f"No active open position found for {symbol}. Ignoring close signal cleanly without placing any order on Bitget.")
+            ign_res = {"success": True, "message": f"No open position found for {symbol}. Close signal ignored cleanly."}
+            database.log_webhook(
+                action=action,
+                symbol=symbol,
+                amount=0.0,
+                market_type=payload.market_type,
+                status="success",
+                tv_payload=raw_payload,
+                exchange_response=ign_res
+            )
+            return {"status": "success", "message": f"No active position for {symbol}. Close signal ignored cleanly.", "details": ign_res}
+            
         result = bitget_client.close_all_positions_for_symbol(ccxt_symbol)
         exec_status = "success" if result.get("success") else "error"
         database.log_webhook(
@@ -891,7 +910,7 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
             tv_payload=raw_payload,
             exchange_response=result
         )
-        return {"message": "Position closed signal processed", "details": result}
+        return {"status": "success", "message": "Position closed signal processed", "details": result}
 
     # Dynamic Percentage Portfolio Sizing if percent parameter is provided (e.g. 10%)
     if (amount <= 0) and payload.percent and payload.percent > 0:
