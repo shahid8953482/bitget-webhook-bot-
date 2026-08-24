@@ -1,6 +1,6 @@
 import logging
 import ccxt
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from config import config
 
 logger = logging.getLogger("bitget_bot")
