@@ -190,24 +190,32 @@ class BitgetExchange:
 
         params: Dict[str, Any] = {}
 
-        # Determine side (buy vs sell) and reduceOnly parameter
+        # Determine side (buy vs sell), tradeSide, holdSide, and reduceOnly parameters
         if action_lower in ["buy", "long"]:
             side = "buy"
             if market_type == "futures":
                 params["tradeSide"] = "open"
+                params["holdSide"] = "long"
+                params["posSide"] = "long"
         elif action_lower in ["sell", "short"]:
             side = "sell"
             if market_type == "futures":
                 params["tradeSide"] = "open"
+                params["holdSide"] = "short"
+                params["posSide"] = "short"
         elif action_lower == "close_long":
             side = "sell"
             if market_type == "futures":
                 params["tradeSide"] = "close"
+                params["holdSide"] = "long"
+                params["posSide"] = "long"
                 params["reduceOnly"] = True
         elif action_lower == "close_short":
             side = "buy"
             if market_type == "futures":
                 params["tradeSide"] = "close"
+                params["holdSide"] = "short"
+                params["posSide"] = "short"
                 params["reduceOnly"] = True
         elif action_lower == "close":
             # Will handle via custom close helper
@@ -230,22 +238,20 @@ class BitgetExchange:
             if market_type == "spot" and side == "buy":
                 params["createMarketBuyOrderRequiresPrice"] = False
                 params["createOrder"] = {"createMarketBuyOrderRequiresPrice": False}
-
-            if order_type.lower() == "limit" and price:
-                order = exchange.create_order(
-                    symbol=ccxt_symbol,
-                    type="limit",
-                    side=side,
-                    amount=amount,
-                    price=price,
-                    params=params
-                )
-            else:
                 order = exchange.create_order(
                     symbol=ccxt_symbol,
                     type="market",
                     side=side,
                     amount=amount,
+                    params=params
+                )
+            else:
+                order = exchange.create_order(
+                    symbol=ccxt_symbol,
+                    type="market" if order_type.lower() != "limit" else "limit",
+                    side=side,
+                    amount=amount,
+                    price=price,
                     params=params
                 )
 
@@ -264,6 +270,35 @@ class BitgetExchange:
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error placing order on Bitget for {ccxt_symbol}: {error_msg}")
+            
+            # Code 40774 fallback: User switched Bitget Futures account to One-Way Mode (Unilateral Position Mode)
+            if "40774" in error_msg or "unilateral" in error_msg.lower():
+                logger.info(f"Account is in One-Way Mode. Retrying order execution without Hedge parameters for {ccxt_symbol}...")
+                try:
+                    oneway_params = {"reduceOnly": True} if (reduce_only or "close" in action_lower) else {}
+                    order = exchange.create_order(
+                        symbol=ccxt_symbol,
+                        type="market" if order_type.lower() != "limit" else "limit",
+                        side=side,
+                        amount=amount,
+                        price=price,
+                        params=oneway_params
+                    )
+                    logger.info(f"One-Way Mode Order executed successfully! Order ID: {order.get('id')}")
+                    return {
+                        "success": True,
+                        "order_id": order.get("id"),
+                        "symbol": ccxt_symbol,
+                        "side": side,
+                        "amount": amount,
+                        "price": order.get("price") or price,
+                        "status": order.get("status"),
+                        "raw_response": order
+                    }
+                except Exception as ex2:
+                    error_msg = str(ex2)
+                    logger.error(f"One-Way Mode Retry error for {ccxt_symbol}: {error_msg}")
+
             return {
                 "success": False,
                 "error": error_msg,
@@ -272,7 +307,7 @@ class BitgetExchange:
             }
 
     def close_all_positions_for_symbol(self, ccxt_symbol: str) -> Dict[str, Any]:
-        """Fetch open positions for a symbol and close them using market reduceOnly orders."""
+        """Fetch open positions for a symbol and close them using market reduceOnly orders with holdSide."""
         try:
             if not self._futures_exchange:
                 return {"success": False, "error": "Futures exchange not initialized"}
@@ -281,20 +316,45 @@ class BitgetExchange:
             closed_results = []
 
             for pos in positions:
-                contracts = float(pos.get("contracts", 0) or pos.get("size", 0) or 0)
+                contracts = float(pos.get("contracts", 0) or pos.get("size", 0) or pos.get("total", 0) or 0)
                 if contracts > 0:
-                    side = pos.get("side") # 'long' or 'short'
-                    close_side = "sell" if side == "long" else "buy"
+                    pos_side = str(pos.get("side", "") or pos.get("holdSide", "") or "long").lower()
+                    if pos_side == "short":
+                        close_side = "buy"
+                        hold_side = "short"
+                    else:
+                        close_side = "sell"
+                        hold_side = "long"
                     
-                    order = self._futures_exchange.create_order(
-                        symbol=ccxt_symbol,
-                        type="market",
-                        side=close_side,
-                        amount=contracts,
-                        params={"reduceOnly": True, "tradeSide": "close"}
-                    )
+                    close_params = {
+                        "reduceOnly": True,
+                        "tradeSide": "close",
+                        "holdSide": hold_side,
+                        "posSide": hold_side
+                    }
+                    
+                    try:
+                        order = self._futures_exchange.create_order(
+                            symbol=ccxt_symbol,
+                            type="market",
+                            side=close_side,
+                            amount=contracts,
+                            params=close_params
+                        )
+                    except Exception as close_err:
+                        if "40774" in str(close_err) or "unilateral" in str(close_err).lower():
+                            order = self._futures_exchange.create_order(
+                                symbol=ccxt_symbol,
+                                type="market",
+                                side=close_side,
+                                amount=contracts,
+                                params={"reduceOnly": True}
+                            )
+                        else:
+                            raise close_err
+
                     closed_results.append({
-                        "side": side,
+                        "side": pos_side,
                         "closed_amount": contracts,
                         "order_id": order.get("id")
                     })
