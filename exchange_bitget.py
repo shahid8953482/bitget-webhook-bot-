@@ -176,6 +176,14 @@ class BitgetExchange:
         if market_type == "futures" and leverage and leverage > 0:
             self.set_leverage(ccxt_symbol, leverage)
 
+        # Auto-close existing positions on Futures before opening new Strategy entry/reversal
+        if market_type == "futures" and action_lower in ["buy", "long", "sell", "short"]:
+            try:
+                logger.info(f"Auto-closing existing positions for {ccxt_symbol} before new {action_lower.upper()} entry...")
+                self.close_all_positions_for_symbol(ccxt_symbol)
+            except Exception as e:
+                logger.warning(f"Auto-close check warning for {ccxt_symbol}: {e}")
+
         params: Dict[str, Any] = {}
 
         # Determine side (buy vs sell) and reduceOnly parameter

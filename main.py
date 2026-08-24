@@ -16,11 +16,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bitget_bot")
 
+import asyncio
+import requests
+
 app = FastAPI(
     title="Bitget TradingView Webhook Bot",
     description="Automated Trading Bot receiving TradingView alerts and executing on Bitget",
     version="1.1.0"
 )
+
+async def keep_alive_ping_loop():
+    """Background task to self-ping server every 4 minutes to prevent Render free instance from sleeping."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            render_url = "https://bitget-webhook-bot-8qsl.onrender.com/health"
+            requests.get(render_url, timeout=5)
+            logger.info("24/7 Keep-Alive ping sent to Render cloud server.")
+        except Exception:
+            pass
+        await asyncio.sleep(240)  # Ping every 4 minutes (240 seconds)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(keep_alive_ping_loop())
 
 # ----------------------------------------------------
 # Pydantic Schemas for Webhook Request Validation
