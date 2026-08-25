@@ -851,9 +851,9 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
     logger.info(f"Incoming Webhook received from IP: {client_ip}")
     raw_payload = payload.model_dump()
 
-    # 1. Verify Passphrase Security
+    # 1. Verify Passphrase Security (Default to config.WEBHOOK_PASSPHRASE if omitted in short JSON)
     request_passphrase = payload.get_passphrase()
-    if request_passphrase != config.WEBHOOK_PASSPHRASE:
+    if request_passphrase and request_passphrase != config.WEBHOOK_PASSPHRASE:
         logger.warning(f"Unauthorized Webhook attempt! Invalid passphrase: '{request_passphrase}' from {client_ip}")
         err_res = {"error": "Invalid security passphrase", "status": "unauthorized"}
         database.log_webhook(
@@ -874,10 +874,12 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
     action = payload.action.lower()
     symbol = payload.get_symbol()
     amount = payload.get_amount()
+    percent = payload.percent if payload.percent and payload.percent > 0 else 10.0
+    leverage = payload.leverage if payload.leverage and payload.leverage > 0 else 20
 
-    logger.info(f"Signal Details -> Action: {action.upper()} | Symbol: {symbol} | Amount: {amount} | Market: {payload.market_type}")
+    logger.info(f"Signal Details -> Action: {action.upper()} | Symbol: {symbol} | Amount: {amount} | Percent: {percent}% | Leverage: {leverage}x")
 
-    # 3. Check for close/exit signals (e.g. 'close', 'Close entry(s) order target01_buy', etc.)
+    # 3. Check for close/exit signals (e.g. 'close', 'close_long', 'close_short', 'target01', etc.)
     is_close_signal = any(term in action for term in ["close", "exit", "cancel", "target01"])
     
     if is_close_signal:
@@ -912,15 +914,15 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
         )
         return {"status": "success", "message": "Position closed signal processed", "details": result}
 
-    # Dynamic Percentage Portfolio Sizing if percent parameter is provided (e.g. 10%)
-    if (amount <= 0) and payload.percent and payload.percent > 0:
+    # Dynamic Percentage Portfolio Sizing if amount is omitted (Default: 10%)
+    if amount <= 0:
         amount = bitget_client.calculate_amount_from_percent(
             symbol=symbol,
-            percent=payload.percent,
-            leverage=payload.leverage or 10,
+            percent=percent,
+            leverage=leverage,
             market_type=payload.market_type
         )
-        logger.info(f"Dynamic {payload.percent}% Portfolio Sizing -> Calculated Amount: {amount} {symbol}")
+        logger.info(f"Dynamic {percent}% Portfolio Sizing -> Calculated Amount: {amount} {symbol}")
 
     # Validation: Amount required for entry orders
     if amount <= 0:
