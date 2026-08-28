@@ -135,7 +135,18 @@ class BitgetExchange:
                 return 0.0
             
             amount = position_notional / price
-            # Round based on market precision (e.g. 0.0007 BTC)
+            
+            # Enforce minimum exchange market amount limits (e.g. min 0.01 XAU for XAU/USDT)
+            try:
+                market = exchange.market(ccxt_symbol)
+                min_amt = float(market.get("limits", {}).get("amount", {}).get("min", 0.0) or 0.0)
+                if min_amt > 0 and amount < min_amt:
+                    logger.info(f"Amount {amount} for {ccxt_symbol} is below market minimum {min_amt}. Adjusting to {min_amt}.")
+                    amount = min_amt
+            except Exception:
+                pass
+
+            # Round based on market precision (e.g. 0.0007 BTC, 0.01 XAU)
             try:
                 prec_str = exchange.amount_to_precision(ccxt_symbol, amount)
                 return float(prec_str)
