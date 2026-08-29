@@ -68,7 +68,10 @@ class BitgetExchange:
         Normalize TradingView symbols (e.g. BTCUSDT, BTCUSDT.P, BTC/USDT) 
         to CCXT unified format (e.g. 'BTC/USDT:USDT' for futures, 'BTC/USDT' for spot).
         """
-        cleaned = raw_symbol.upper().replace(".P", "").replace(".PERP", "").replace("/", "").replace("-", "")
+        raw_upper = raw_symbol.upper().replace(".P", "").replace(".PERP", "")
+        if ":" in raw_upper:
+            raw_upper = raw_upper.split(":")[0]
+        cleaned = raw_upper.replace("/", "").replace("-", "")
         
         # Determine base & quote (Assuming USDT quote by default)
         if cleaned.endswith("USDT"):
@@ -81,7 +84,6 @@ class BitgetExchange:
             base = cleaned[:-4]
             quote = "USDC"
         else:
-            # Fallback
             base = cleaned
             quote = "USDT"
 
