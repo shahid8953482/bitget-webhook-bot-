@@ -879,14 +879,18 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
 
     logger.info(f"Signal Details -> Action: {action.upper()} | Symbol: {symbol} | Amount: {amount} | Percent: {percent}% | Leverage: {leverage}x")
 
-    # 3. Check for close/exit signals (e.g. 'close', 'close_long', 'close_short', 'target01', etc.)
-    is_close_signal = any(term in action for term in ["close", "exit", "cancel", "target01"])
+    # 3. Check for explicit close/exit signals (e.g. 'close', 'close_long', 'close_short', 'target01', etc.)
+    ccxt_symbol = bitget_client.normalize_symbol(symbol, payload.market_type)
+    open_positions = bitget_client.get_open_positions()
+    matching_pos = [p for p in open_positions if bitget_client.normalize_symbol(p["symbol"], "futures") == ccxt_symbol]
     
-    if is_close_signal:
-        ccxt_symbol = bitget_client.normalize_symbol(symbol, payload.market_type)
-        open_positions = bitget_client.get_open_positions()
-        matching_pos = [p for p in open_positions if bitget_client.normalize_symbol(p["symbol"], "futures") == ccxt_symbol]
-        
+    is_explicit_close = any(term in action for term in ["close", "exit", "cancel", "target01"])
+    
+    # Intelligent Exit Detection for standard TradingView strategy signals (SELL on Long Exit / BUY on Short Exit)
+    is_long_exit_sell = (action in ["sell", "short"]) and any(p["side"].lower() == "long" for p in matching_pos)
+    is_short_exit_buy = (action in ["buy", "long"]) and any(p["side"].lower() == "short" for p in matching_pos)
+    
+    if is_explicit_close or is_long_exit_sell or is_short_exit_buy:
         if not matching_pos:
             logger.info(f"No active open position found for {symbol}. Ignoring close signal cleanly without placing any order on Bitget.")
             ign_res = {"success": True, "message": f"No open position found for {symbol}. Close signal ignored cleanly."}
@@ -901,6 +905,7 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
             )
             return {"status": "success", "message": f"No active position for {symbol}. Close signal ignored cleanly.", "details": ign_res}
             
+        logger.info(f"Position exit detected for {symbol} (Action: {action.upper()}). Closing active open position cleanly...")
         result = bitget_client.close_all_positions_for_symbol(ccxt_symbol)
         exec_status = "success" if result.get("success") else "error"
         database.log_webhook(
@@ -912,7 +917,7 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
             tv_payload=raw_payload,
             exchange_response=result
         )
-        return {"status": "success", "message": "Position closed signal processed", "details": result}
+        return {"status": "success", "message": f"Position exit signal ({action.upper()}) processed cleanly", "details": result}
 
     # Dynamic Percentage Portfolio Sizing if amount is omitted (Default: 10%)
     if amount <= 0:
