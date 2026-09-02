@@ -19,7 +19,7 @@ logger = logging.getLogger("bitget_bot")
 app = FastAPI(
     title="Bitget TradingView Webhook Bot",
     description="Automated Trading Bot receiving TradingView alerts and executing on Bitget",
-    version="1.3.0"
+    version="1.2.0"
 )
 
 # ----------------------------------------------------
@@ -34,7 +34,7 @@ class WebhookPayload(BaseModel):
     ticker: Optional[str] = Field(default=None, description="Alternative field for symbol")
     
     # Amount / Contracts / Quantity flex fields
-    amount: Optional[float] = Field(default=None, descripZZZZtion="Order quantity/contracts")
+    amount: Optional[float] = Field(default=None, description="Order quantity/contracts")
     contracts: Optional[float] = Field(default=None, description="TradingView strategy contracts")
     quantity: Optional[float] = Field(default=None, description="Alternative name for amount")
     
@@ -64,9 +64,15 @@ class WebhookPayload(BaseModel):
 @app.get("/dashboard", response_class=HTMLResponse)
 def serve_dashboard():
     """Serve the Web Dashboard HTML page."""
-    html_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
-    if os.path.exists(html_path):
-        return FileResponse(html_path)
+    possible_paths = [
+        os.path.join(os.path.dirname(__file__), "templates", "dashboard.html"),
+        os.path.join(os.path.dirname(__file__), "dashboard.html"),
+        os.path.join(os.getcwd(), "templates", "dashboard.html"),
+        os.path.join(os.getcwd(), "dashboard.html"),
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            return FileResponse(path)
     return HTMLResponse("<h2>Dashboard template not found</h2>", status_code=404)
 
 @app.get("/health")
@@ -151,14 +157,11 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
         
         # Short exit variants
         "exitsell": "short",
-        "exitcell": "short",
         "exitshort": "short",
         "closesell": "short",
-        "closecell": "short",
         "closeshort": "short",
         "close_short": "short",
         "close_sell": "short",
-        "close_cell": "short",
         "closeshortposition": "short",
         "exitsellorder": "short",
 
@@ -184,7 +187,7 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
         if target_side is None:
             if "buy" in action_clean or "long" in action_clean:
                 target_side = "long"
-            elif "sell" in action_clean or "short" in action_clean or "cell" in action_clean:
+            elif "sell" in action_clean or "short" in action_clean:
                 target_side = "short"
 
         logger.info(f"Handling Exit Signal: Target Side={target_side or 'ALL'} | Symbol={symbol} | Amount={amount or '100% full position'}")
