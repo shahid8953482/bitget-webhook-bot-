@@ -63,12 +63,24 @@ class BitgetExchange:
         except Exception as e:
             logger.error(f"Failed to initialize Bitget Spot exchange: {e}")
 
+    def clean_ticker(self, symbol: str) -> str:
+        """Extract clean symbol ticker e.g. BTCUSDT from BINANCE:BTCUSDT, BTC/USDT:USDT, or BTCUSDT.P"""
+        s = str(symbol).upper().strip()
+        # Handle exchange prefix e.g. BINANCE:BTCUSDT or BITGET:BTCUSDT
+        if ":" in s:
+            parts = s.split(":")
+            if len(parts) == 2 and not parts[1].startswith("USDT") and not parts[1].startswith("USD"):
+                s = parts[1]
+            elif len(parts) == 2 and (parts[1] == "USDT" or parts[1] == "USD"):
+                s = parts[0]
+        return s.replace(".P", "").replace(".PERP", "").replace("/", "").replace("-", "").replace(":USDT", "").replace(":USD", "")
+
     def normalize_symbol(self, raw_symbol: str, market_type: str = "futures") -> str:
         """
-        Normalize TradingView symbols (e.g. BTCUSDT, BTCUSDT.P, BTC/USDT) 
+        Normalize TradingView symbols (e.g. BTCUSDT, BTCUSDT.P, BINANCE:BTCUSDT) 
         to CCXT unified format (e.g. 'BTC/USDT:USDT' for futures, 'BTC/USDT' for spot).
         """
-        cleaned = raw_symbol.upper().replace(".P", "").replace(".PERP", "").replace("/", "").replace("-", "").replace(":USDT", "")
+        cleaned = self.clean_ticker(raw_symbol)
         
         # Determine base & quote (Assuming USDT quote by default)
         if cleaned.endswith("USDT"):
@@ -90,10 +102,6 @@ class BitgetExchange:
             # USDT-M Perpetual futures format in CCXT: BASE/QUOTE:MARGIN_CURRENCY
             return f"{base}/{quote}:{quote}"
 
-    def clean_ticker(self, symbol: str) -> str:
-        """Extract clean symbol ticker e.g. ZECUSDT from ZEC/USDT:USDT or ZECUSDT.P"""
-        return symbol.upper().replace(".P", "").replace(".PERP", "").replace("/", "").replace("-", "").replace(":USDT", "").replace(":USD", "")
-
     def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "cross") -> bool:
         """Set leverage for a futures symbol."""
         try:
@@ -108,6 +116,55 @@ class BitgetExchange:
         except Exception as e:
             logger.warning(f"Set leverage warning for {symbol}: {e}")
             return False
+
+    def calculate_default_amount(self, symbol: str, price: Optional[float] = None, market_type: str = "futures") -> float:
+        """
+        If TradingView alert does not specify amount/contracts,
+        automatically calculate an optimal order amount using available balance or min allowed.
+        """
+        try:
+            self._initialize_exchanges()
+            ccxt_symbol = self.normalize_symbol(symbol, market_type)
+            exchange = self._futures_exchange if market_type == "futures" else self._spot_exchange
+            if not exchange:
+                return 0.01
+
+            exchange.load_markets()
+            market = exchange.market(ccxt_symbol)
+            min_amount = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
+            min_cost = float(market.get("limits", {}).get("cost", {}).get("min") or 5.0)
+
+            # Fetch current live price from exchange
+            try:
+                ticker = exchange.fetch_ticker(ccxt_symbol)
+                live_price = float(ticker.get("last") or ticker.get("close") or 0.0)
+                if live_price > 0:
+                    price = live_price
+            except Exception:
+                pass
+
+            if not price or price <= 0:
+                price = 1.0
+
+            # Target position notional: safe $10-$20 notional (only requires ~$0.5 - $1 margin)
+            target_notional = max(min_cost * 1.5, 10.0)
+            calculated_amount = target_notional / price
+
+            final_amount = max(calculated_amount, min_amount)
+            precision = market.get("precision", {}).get("amount")
+            if precision is not None:
+                if isinstance(precision, int):
+                    final_amount = round(final_amount, precision)
+                elif isinstance(precision, float):
+                    final_amount = round(final_amount, len(str(precision).split(".")[1]))
+            else:
+                final_amount = round(final_amount, 3)
+
+            logger.info(f"Auto-calculated default order amount for {symbol}: {final_amount} (Price: {price})")
+            return max(final_amount, min_amount)
+        except Exception as e:
+            logger.error(f"Error calculating default order amount for {symbol}: {e}")
+            return 0.01
 
     def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch all active open futures positions from Bitget."""
@@ -159,12 +216,13 @@ class BitgetExchange:
     ) -> Dict[str, Any]:
         """
         Safely place futures orders on Bitget.
-        Handles One-Way Mode (empty params) and Two-Way/Hedge Mode (tradeSide) automatically.
+        Automatically adapts to One-Way (Unilateral) and Hedge (Two-Way) position modes.
+        Handles errors 40773 and 40774 seamlessly.
         """
         if params is None:
             params = {}
 
-        # 1. First Attempt with provided params
+        # 1. First attempt with provided params
         try:
             if order_type.lower() == "limit" and price:
                 return self._futures_exchange.create_order(
@@ -185,13 +243,22 @@ class BitgetExchange:
                 )
         except Exception as e:
             err_str = str(e)
-            logger.warning(f"Futures order attempt failed: {err_str}. Checking for position mode conflict...")
+            logger.warning(f"Futures order attempt 1 failed: {err_str}. Auto-resolving position mode...")
 
-            # Case A: Error 40773 ("Closed positions can only occur in two-way positions")
-            # In One-Way mode on Bitget, BOTH reduceOnly and tradeSide cause 40773.
-            # Fix: Retry as a pure market order with completely empty params!
-            if "40773" in err_str or "two-way positions" in err_str or "Closed positions can only occur in two-way" in err_str:
-                logger.info("Detected One-Way Mode on Bitget. Retrying as pure market order with empty params...")
+            # Check if this is an exit or entry
+            is_close = params.get("tradeSide", "").lower() == "close" or params.get("reduceOnly")
+
+            # Strategy 1: If Two-Way / Hedge mode is required (Error 40774 / 40773 / tradeSide / unilateral)
+            try:
+                hedge_params = params.copy()
+                if is_close:
+                    hedge_params["tradeSide"] = "Close"
+                    hedge_params["hedged"] = True
+                else:
+                    hedge_params["tradeSide"] = "Open"
+                    hedge_params["hedged"] = True
+
+                logger.info(f"Retrying with Hedge Mode params: {hedge_params}...")
                 if order_type.lower() == "limit" and price:
                     return self._futures_exchange.create_order(
                         symbol=symbol,
@@ -199,7 +266,7 @@ class BitgetExchange:
                         side=side,
                         amount=amount,
                         price=price,
-                        params={}
+                        params=hedge_params
                     )
                 else:
                     return self._futures_exchange.create_order(
@@ -207,16 +274,15 @@ class BitgetExchange:
                         type="market",
                         side=side,
                         amount=amount,
-                        params={}
+                        params=hedge_params
                     )
+            except Exception as e2:
+                logger.warning(f"Hedge mode retry failed: {e2}. Trying pure One-Way mode (empty params)...")
 
-            # Case B: Two-Way / Hedge Mode is active on account and requires tradeSide
-            elif "tradeSide" in err_str or "posSide" in err_str or "two-way" in err_str:
-                logger.info("Detected Two-Way (Hedge) Mode on Bitget. Retrying with tradeSide...")
-                retry_params = params.copy()
-                if "tradeSide" not in retry_params:
-                    retry_params["tradeSide"] = "close"
-
+            # Strategy 2: Pure One-Way Mode (Clean params, no tradeSide, no hedged flag)
+            try:
+                clean_params = {k: v for k, v in params.items() if k not in ["tradeSide", "hedged", "holdSide", "posSide", "reduceOnly"]}
+                logger.info(f"Retrying with One-Way Mode params: {clean_params}...")
                 if order_type.lower() == "limit" and price:
                     return self._futures_exchange.create_order(
                         symbol=symbol,
@@ -224,7 +290,7 @@ class BitgetExchange:
                         side=side,
                         amount=amount,
                         price=price,
-                        params=retry_params
+                        params=clean_params
                     )
                 else:
                     return self._futures_exchange.create_order(
@@ -232,11 +298,11 @@ class BitgetExchange:
                         type="market",
                         side=side,
                         amount=amount,
-                        params=retry_params
+                        params=clean_params
                     )
-
-            # Re-raise if other error
-            raise e
+            except Exception as e3:
+                logger.error(f"All order placement attempts failed: {e3}")
+                raise e3
 
     def close_position(
         self,
@@ -312,8 +378,6 @@ class BitgetExchange:
 
                 logger.info(f"Sending Market Close Order: Symbol={pos_sym} | Side={close_side} | Amount={close_amount} | Closing Position={pos_side.upper()}")
 
-                # In One-Way Mode (Single position mode), Bitget executes a pure market order (empty params).
-                # _create_futures_order will auto-retry if Hedge Mode is active.
                 order = self._create_futures_order(
                     symbol=pos_sym,
                     order_type="market",
@@ -388,9 +452,9 @@ class BitgetExchange:
         action_clean = action.lower().replace(" ", "").replace("_", "").replace("-", "")
 
         # Handle exit actions
-        if action_clean in ["exitbuy", "exitlong", "closebuy", "closelong", "close_long"]:
+        if action_clean in ["exitbuy", "exitlong", "closebuy", "closelong", "close_long", "close_buy"]:
             return self.close_position(symbol=symbol, target_side="long", amount=amount if amount > 0 else None, market_type=market_type)
-        if action_clean in ["exitsell", "exitshort", "closesell", "closeshort", "close_short"]:
+        if action_clean in ["exitsell", "exitshort", "closesell", "closeshort", "close_short", "close_sell", "exitcell", "closecell"]:
             return self.close_position(symbol=symbol, target_side="short", amount=amount if amount > 0 else None, market_type=market_type)
         if action_clean in ["close", "closeall", "exit", "exitall", "flatten"]:
             return self.close_position(symbol=symbol, target_side=None, amount=amount if amount > 0 else None, market_type=market_type)
@@ -408,9 +472,9 @@ class BitgetExchange:
         params: Dict[str, Any] = {}
 
         # Determine side (buy vs sell)
-        if action_clean in ["buy", "long"]:
+        if action_clean in ["buy", "long", "openlong", "enterlong", "entrylong"]:
             side = "buy"
-        elif action_clean in ["sell", "short"]:
+        elif action_clean in ["sell", "short", "cell", "openshort", "entershort", "entryshort", "sellshort"]:
             side = "sell"
         else:
             return {"success": False, "error": f"Invalid action: {action}"}
