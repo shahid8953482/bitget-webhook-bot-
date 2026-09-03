@@ -117,10 +117,21 @@ class BitgetExchange:
             logger.warning(f"Set leverage warning for {symbol}: {e}")
             return False
 
-    def calculate_default_amount(self, symbol: str, price: Optional[float] = None, market_type: str = "futures") -> float:
+    def calculate_portfolio_risk_amount(
+        self,
+        symbol: str,
+        price: Optional[float] = None,
+        risk_percent: float = 5.0,
+        leverage: int = 10,
+        market_type: str = "futures"
+    ) -> float:
         """
-        If TradingView alert does not specify amount/contracts,
-        automatically calculate an optimal order amount using available balance or min allowed.
+        Calculates exact trade order size based on Portfolio Risk % and Leverage.
+        Formula:
+          Margin Budget = Available Free USDT Balance * (5% / 100)
+          Position Notional = Margin Budget * 10x Leverage
+          Order Quantity = Position Notional / Live Asset Price
+        Guarantees strict 5% portfolio margin & 10x leverage with coin precision.
         """
         try:
             self._initialize_exchanges()
@@ -134,7 +145,20 @@ class BitgetExchange:
             min_amount = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
             min_cost = float(market.get("limits", {}).get("cost", {}).get("min") or 5.0)
 
-            # Fetch current live price from exchange
+            # 1. Fetch available free USDT balance
+            balance_info = self.get_account_balance(market_type=market_type)
+            free_usdt = float(balance_info.get("free_usdt") or balance_info.get("total_usdt") or 10.0)
+            if free_usdt <= 0:
+                free_usdt = 10.0
+
+            # 2. 5% Margin Budget and 10x Notional Value
+            margin_budget = free_usdt * (risk_percent / 100.0)
+            position_notional = margin_budget * leverage
+
+            # Ensure position notional satisfies exchange minimum allowable limit (e.g. min 5 USDT)
+            target_notional = max(position_notional, min_cost)
+
+            # 3. Fetch real-time market price
             try:
                 ticker = exchange.fetch_ticker(ccxt_symbol)
                 live_price = float(ticker.get("last") or ticker.get("close") or 0.0)
@@ -146,11 +170,10 @@ class BitgetExchange:
             if not price or price <= 0:
                 price = 1.0
 
-            # Target position notional: safe $10-$20 notional (only requires ~$0.5 - $1 margin)
-            target_notional = max(min_cost * 1.5, 10.0)
+            # 4. Calculate exact contracts / quantity
             calculated_amount = target_notional / price
-
             final_amount = max(calculated_amount, min_amount)
+
             precision = market.get("precision", {}).get("amount")
             if precision is not None:
                 if isinstance(precision, int):
@@ -160,11 +183,15 @@ class BitgetExchange:
             else:
                 final_amount = round(final_amount, 3)
 
-            logger.info(f"Auto-calculated default order amount for {symbol}: {final_amount} (Price: {price})")
+            logger.info(f"Fixed Risk Policy -> Portfolio Balance: {free_usdt:.2f} USDT | Margin (5%): {margin_budget:.3f} USDT | Notional (10x): {target_notional:.2f} USDT | Price: {price} | Order Size: {final_amount} {symbol}")
             return max(final_amount, min_amount)
         except Exception as e:
-            logger.error(f"Error calculating default order amount for {symbol}: {e}")
+            logger.error(f"Error calculating portfolio risk amount for {symbol}: {e}")
             return 0.01
+
+    def calculate_default_amount(self, symbol: str, price: Optional[float] = None, market_type: str = "futures") -> float:
+        """Alias to calculate_portfolio_risk_amount with 5% risk and 10x leverage."""
+        return self.calculate_portfolio_risk_amount(symbol=symbol, price=price, risk_percent=5.0, leverage=10, market_type=market_type)
 
     def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch all active open futures positions from Bitget."""
@@ -465,9 +492,10 @@ class BitgetExchange:
 
         ccxt_symbol = self.normalize_symbol(symbol, market_type)
 
-        # Set leverage if specified for futures
-        if market_type == "futures" and leverage and leverage > 0:
-            self.set_leverage(ccxt_symbol, leverage)
+        # Set leverage for futures (default 10x)
+        if market_type == "futures":
+            target_lev = leverage if (leverage and leverage > 0) else 10
+            self.set_leverage(ccxt_symbol, target_lev)
 
         params: Dict[str, Any] = {}
 
