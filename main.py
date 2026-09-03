@@ -223,15 +223,17 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
                 "error": result.get("error")
             }
 
-    # 4. For Entry Orders (BUY, SELL, LONG, SHORT):
-    # If amount is not specified in TradingView alert, auto-calculate optimal safe size!
-    if amount <= 0:
-        amount = bitget_client.calculate_default_amount(
-            symbol=symbol,
-            price=payload.price,
-            market_type=payload.market_type
-        )
-        logger.info(f"Amount omitted in webhook alert. Auto-calculated order size: {amount} {symbol}")
+    # 4. Strict Risk Management Policy:
+    # Always enforce 5% Portfolio Margin & 10x Leverage (regardless of TradingView payload inputs)
+    enforced_leverage = 10
+    amount = bitget_client.calculate_portfolio_risk_amount(
+        symbol=symbol,
+        price=payload.price,
+        risk_percent=5.0,
+        leverage=enforced_leverage,
+        market_type=payload.market_type
+    )
+    logger.info(f"Strict 5% Portfolio Risk Applied -> Symbol: {symbol} | Amount: {amount} | Leverage: {enforced_leverage}x")
 
     # 5. Execute Entry Order on Bitget
     result = bitget_client.execute_order(
@@ -241,7 +243,7 @@ async def receive_webhook(payload: WebhookPayload, request: Request):
         market_type=payload.market_type,
         order_type=payload.order_type,
         price=payload.price,
-        leverage=payload.leverage,
+        leverage=enforced_leverage,
         stop_loss=payload.stop_loss,
         take_profit=payload.take_profit
     )
